@@ -1,30 +1,34 @@
 use std::{
-    collections::HashMap, future::Future, hash::BuildHasher, path::Path, sync::Arc, time::Duration,
+    collections::HashMap, future::Future, hash::BuildHasher, path::Path, process::exit, sync::Arc,
+    time::Duration,
 };
 
-use glam::{DVec2, Mat3A, Mat4, UVec2, Vec3, Vec3A};
+use glam::{uvec2, vec2, DVec2, Mat3A, Mat4, UVec2, Vec2, Vec3, Vec3A};
+use inox2d::formats::inp::parse_inp;
+use log::{info, logger};
 use pico_args::Arguments;
 use rend3::{
     types::{
-        Backend, Camera, CameraProjection, DirectionalLight, DirectionalLightHandle, SampleCount,
-        Texture, TextureFormat,
+        Backend, Camera, CameraProjection, DirectionalLight, DirectionalLightHandle, Handedness,
+        SampleCount, Texture, TextureFormat,
     },
     util::typedefs::FastHashMap,
     Renderer, RendererProfile,
 };
-use rend3_framework::{lock, AssetPath, Mutex, UserResizeEvent};
+use rend3_framework::{lock, App as _, AssetPath, Event, Mutex, UserResizeEvent};
 use rend3_gltf::GltfSceneInstance;
 use rend3_routine::{base::BaseRenderGraph, pbr::NormalTextureYDirection, skybox::SkyboxRoutine};
 use web_time::Instant;
+use wgpu::{Features, Surface};
 use wgpu_profiler::GpuTimerScopeResult;
 #[cfg(target_arch = "wasm32")]
 use winit::keyboard::PhysicalKey::Code;
 #[cfg(not(target_arch = "wasm32"))]
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::{
-    event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, WindowEvent},
+    event::{DeviceEvent, ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::EventLoopWindowTarget,
-    window::{Fullscreen, WindowBuilder},
+    window::{Fullscreen, Window, WindowBuilder},
 };
 
 mod platform;
@@ -56,7 +60,7 @@ async fn load_skybox(
     load_skybox_image(loader, &mut data, "skybox/back.jpg").await;
 
     let handle = renderer.add_texture_cube(Texture {
-        format: TextureFormat::Rgba8UnormSrgb,
+        format: TextureFormat::Bgra8Unorm,
         size: UVec2::new(2048, 2048),
         data,
         label: Some("background".into()),
@@ -310,17 +314,19 @@ struct SceneViewer {
     previous_profiling_stats: Option<Vec<GpuTimerScopeResult>>,
     timestamp_last_second: Instant,
     timestamp_last_frame: Instant,
+    timestamp_start: Instant,
     frame_times: histogram::Histogram,
     last_mouse_delta: Option<DVec2>,
 
     grabber: Option<rend3_framework::Grabber>,
-    puppet: String,
+    inox_model: inox2d::model::Model,
+    inox_renderer: Option<inox2d_wgpu::Renderer>,
 }
 impl SceneViewer {
     pub fn new() -> Self {
         #[cfg(feature = "tracy")]
         tracy_client::Client::start();
-
+        let timestamp_start = Instant::now();
         let mut args = Arguments::from_vec(std::env::args_os().skip(1).collect());
 
         // Meta
@@ -413,6 +419,21 @@ impl SceneViewer {
         if let Some(shadow_resolution) = shadow_resolution {
             gltf_settings.directional_light_resolution = shadow_resolution;
         }
+        let inox_model = parse_inp(
+            pollster::block_on(async {
+                let loader = rend3_framework::AssetLoader::new_local(
+                    concat!(env!("CARGO_MANIFEST_DIR"), "/"),
+                    "",
+                    "http://localhost:8000/",
+                );
+                loader
+                    .get_asset(AssetPath::Internal(&puppet))
+                    .await
+                    .unwrap()
+            })
+            .as_slice(),
+        )
+        .unwrap();
 
         Self {
             absolute_mouse,
@@ -420,7 +441,8 @@ impl SceneViewer {
             desired_device_name,
             desired_profile: desired_mode,
             file_to_load,
-            puppet,
+            inox_renderer: None,
+            inox_model,
             walk_speed,
             run_speed,
             gltf_settings,
@@ -430,7 +452,7 @@ impl SceneViewer {
             ambient_light_level,
             present_mode,
             samples,
-
+            timestamp_start,
             fullscreen,
 
             scancode_status: FastHashMap::default(),
@@ -450,6 +472,40 @@ impl SceneViewer {
 impl rend3_framework::App for SceneViewer {
     const HANDEDNESS: rend3::types::Handedness = rend3::types::Handedness::Right;
 
+    fn create_window(
+        &mut self,
+        builder: WindowBuilder,
+    ) -> Result<
+        (
+            winit::event_loop::EventLoop<UserResizeEvent<()>>,
+            winit::window::Window,
+        ),
+        winit::error::EventLoopError,
+    > {
+        profiling::scope!("creating window");
+
+        let event_loop = winit::event_loop::EventLoopBuilder::with_user_event().build()?;
+        let window = builder.build(&event_loop).expect("Could not build window");
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            use winit::platform::web::WindowExtWebSys;
+
+            let canvas = window.canvas().unwrap();
+            let style = canvas.style();
+            style.set_property("width", "100%").unwrap();
+            style.set_property("height", "100%").unwrap();
+
+            web_sys::window()
+                .and_then(|win| win.document())
+                .and_then(|doc| doc.body())
+                .and_then(|body| body.append_child(&canvas).ok())
+                .expect("couldn't append canvas to document body");
+        }
+
+        Ok((event_loop, window))
+    }
+
     fn create_iad<'a>(
         &'a mut self,
     ) -> std::pin::Pin<
@@ -460,10 +516,18 @@ impl rend3_framework::App for SceneViewer {
                 self.desired_backend,
                 self.desired_device_name.clone(),
                 self.desired_profile,
-                None,
+                Some(Features::ADDRESS_MODE_CLAMP_TO_BORDER),
             )
             .await?)
         })
+    }
+
+    fn create_base_rendergraph(
+        &mut self,
+        renderer: &Arc<Renderer>,
+        spp: &rend3::ShaderPreProcessor,
+    ) -> BaseRenderGraph {
+        BaseRenderGraph::new(renderer, spp)
     }
 
     fn sample_count(&self) -> SampleCount {
@@ -510,6 +574,15 @@ impl rend3_framework::App for SceneViewer {
         let file_to_load = self.file_to_load.take();
         let renderer = Arc::clone(renderer);
         let routines = Arc::clone(routines);
+        let mut inox_renderer = inox2d_wgpu::Renderer::new(
+            &renderer.device,
+            &renderer.queue,
+            wgpu::TextureFormat::Bgra8Unorm,
+            &self.inox_model,
+            uvec2(window.inner_size().width, window.inner_size().height),
+        );
+        inox_renderer.camera.scale = Vec2::splat(0.12);
+        self.inox_renderer = Some(inox_renderer);
         spawn(async move {
             let loader = rend3_framework::AssetLoader::new_local(
                 concat!(env!("CARGO_MANIFEST_DIR"), "/resources/"),
@@ -581,8 +654,6 @@ impl rend3_framework::App for SceneViewer {
                 }
 
                 self.timestamp_last_frame = now;
-
-                // std::thread::sleep(Duration::from_millis(100));
 
                 let rotation = Mat3A::from_euler(
                     glam::EulerRot::XYZ,
@@ -665,7 +736,9 @@ impl rend3_framework::App for SceneViewer {
                     },
                     view,
                 });
+                /*
 
+                */
                 // Get a frame
                 let frame = surface.unwrap().get_current_texture().unwrap();
                 // Lock all the routines
@@ -726,6 +799,48 @@ impl rend3_framework::App for SceneViewer {
                 );
                 // Dispatch a render using the built up rendergraph!
                 self.previous_profiling_stats = graph.execute(renderer, &mut eval_output);
+                {
+                    let puppet = &mut self.inox_model.puppet;
+                    puppet.begin_set_params();
+                    let t = self.timestamp_start.elapsed().as_secs_f32();
+                    puppet.set_param("Head:: Yaw-Pitch", vec2(t.cos(), t.sin()));
+                    puppet.end_set_params();
+                }
+
+                let temp_texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size: frame.texture.size(),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: frame.texture.format(),
+                    usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[frame.texture.format()],
+                });
+
+                let temp_view = temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+                if let Some(ref mut ir) = self.inox_renderer {
+                    ir.render(
+                        &renderer.queue,
+                        &renderer.device,
+                        &self.inox_model.puppet,
+                        &temp_view,
+                    )
+                };
+
+                let mut encoder =
+                    renderer
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Part Render Encoder"),
+                        });
+                encoder.copy_texture_to_texture(
+                    temp_texture.as_image_copy(),
+                    frame.texture.as_image_copy(),
+                    frame.texture.size(),
+                );
+                renderer.queue.submit(std::iter::once(encoder.finish()));
 
                 frame.present();
                 // mark the end of the frame for tracy/other profilers
@@ -833,6 +948,12 @@ impl rend3_framework::App for SceneViewer {
         }
     }
 }
+struct StoredSurfaceInfo {
+    size: UVec2,
+    scale_factor: f32,
+    sample_count: SampleCount,
+    present_mode: wgpu::PresentMode,
+}
 
 #[cfg_attr(
     target_os = "android",
@@ -847,6 +968,301 @@ pub fn main() {
     if app.fullscreen {
         builder = builder.with_fullscreen(Some(Fullscreen::Borderless(None)));
     }
+    {
+        #[cfg(target_arch = "wasm32")]
+        {
+            wasm_bindgen_futures::spawn_local(async_start(app, builder));
+        }
 
-    rend3_framework::start(app, builder);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pollster::block_on({
+                let mut app = app;
+                async move {
+                    app.register_logger();
+                    app.register_panic_hook();
+                    let Ok((event_loop, window)) = app.create_window(builder.with_visible(false))
+                    else {
+                        exit(1)
+                    };
+                    let window_size = window.inner_size();
+                    let iad = app.create_iad().await.unwrap();
+                    let mut surface = if cfg!(target_os = "android") {
+                        None
+                    } else {
+                        Some(Arc::new(
+                            unsafe { iad.instance.create_surface(&window) }.unwrap(),
+                        ))
+                    };
+                    let renderer = rend3::Renderer::new(
+                        iad.clone(),
+                        Handedness::Right,
+                        Some(window_size.width as f32 / window_size.height as f32),
+                    )
+                    .unwrap();
+                    let format = surface.as_ref().map_or(TextureFormat::Bgra8Unorm, |s| {
+                        //                        let caps = s.get_capabilities(&iad.adapter);
+                        let format = TextureFormat::Bgra8Unorm;
+                        //                        let format = caps.formats[0];
+
+                        // Configure the surface to be ready for rendering.
+                        rend3::configure_surface(
+                            s,
+                            &iad.device,
+                            format,
+                            glam::UVec2::new(window_size.width, window_size.height),
+                            rend3::types::PresentMode::Fifo,
+                        );
+                        let alpha_mode = wgpu::CompositeAlphaMode::Auto;
+                        let config = wgpu::SurfaceConfiguration {
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                                | wgpu::TextureUsages::COPY_DST,
+                            format: wgpu::TextureFormat::Bgra8Unorm,
+                            width: window_size.width,
+                            height: window_size.height,
+                            present_mode: wgpu::PresentMode::Fifo,
+                            alpha_mode,
+                            view_formats: Vec::new(),
+                        };
+                        surface
+                            .as_ref()
+                            .unwrap()
+                            .configure(&renderer.device, &config);
+
+                        format
+                    });
+                    let mut spp = rend3::ShaderPreProcessor::new();
+                    rend3_routine::builtin_shaders(&mut spp);
+                    let base_rendergraph = app.create_base_rendergraph(&renderer, &spp);
+                    let mut data_core = renderer.data_core.lock();
+                    let routines = Arc::new(rend3_framework::DefaultRoutines {
+                        pbr: Mutex::new(rend3_routine::pbr::PbrRoutine::new(
+                            &renderer,
+                            &mut data_core,
+                            &spp,
+                            &base_rendergraph.interfaces,
+                            &base_rendergraph.gpu_culler.culling_buffer_map_handle,
+                        )),
+                        skybox: Mutex::new(rend3_routine::skybox::SkyboxRoutine::new(
+                            &renderer,
+                            &spp,
+                            &base_rendergraph.interfaces,
+                        )),
+                        tonemapping: Mutex::new(
+                            rend3_routine::tonemapping::TonemappingRoutine::new(
+                                &renderer,
+                                &spp,
+                                &base_rendergraph.interfaces,
+                                format,
+                            ),
+                        ),
+                    });
+                    drop(data_core);
+                    app.setup(&event_loop, &window, &renderer, &routines, format);
+                    #[cfg(target_arch = "wasm32")]
+                    let _observer =
+                        resize_observer::ResizeObserver::new(&window, event_loop.create_proxy());
+                    window.set_visible(true);
+                    let mut suspended = cfg!(target_os = "android");
+                    let mut last_user_control_mode = winit::event_loop::ControlFlow::Poll;
+                    let mut stored_surface_info = StoredSurfaceInfo {
+                        size: glam::UVec2::new(window_size.width, window_size.height),
+                        scale_factor: app.scale_factor(),
+                        sample_count: app.sample_count(),
+                        present_mode: app.present_mode(),
+                    };
+                    #[allow(clippy::let_unit_value)]
+                    let _ = winit_run(event_loop, move |event, event_loop_window_target| {
+                        let event = match event {
+                            Event::UserEvent(UserResizeEvent::Resize { size, window_id }) => {
+                                Event::WindowEvent {
+                                    window_id,
+                                    event: WindowEvent::Resized(size),
+                                }
+                            }
+                            e => e,
+                        };
+                        let mut control_flow = event_loop_window_target.control_flow();
+                        if let Some(suspend) = handle_surface(
+                            &app,
+                            &window,
+                            &event,
+                            &iad.instance,
+                            &mut surface,
+                            &renderer,
+                            format,
+                            &mut stored_surface_info,
+                        ) {
+                            suspended = suspend;
+                        }
+
+                        // We move to Wait when we get suspended so we don't spin at 50k FPS.
+                        match event {
+                            Event::Suspended => {
+                                control_flow = winit::event_loop::ControlFlow::Wait;
+                            }
+                            Event::Resumed => {
+                                control_flow = last_user_control_mode;
+                            }
+                            _ => {}
+                        }
+
+                        // We need to block all updates
+                        if let Event::WindowEvent {
+                            window_id: _,
+                            event: winit::event::WindowEvent::RedrawRequested,
+                        } = event
+                        {
+                            if suspended {
+                                return;
+                            }
+                        }
+
+                        app.handle_event(
+                            &window,
+                            &renderer,
+                            &routines,
+                            &base_rendergraph,
+                            surface.as_ref(),
+                            stored_surface_info.size,
+                            event,
+                            |c: winit::event_loop::ControlFlow| {
+                                control_flow = c;
+                                last_user_control_mode = c;
+                            },
+                            event_loop_window_target,
+                        )
+                    });
+                }
+            });
+        }
+    };
+}
+#[allow(clippy::too_many_arguments)]
+fn handle_surface(
+    app: &SceneViewer,
+    window: &Window,
+    event: &Event<()>,
+    instance: &wgpu::Instance,
+    surface: &mut Option<Arc<Surface>>,
+    renderer: &Arc<Renderer>,
+    format: rend3::types::TextureFormat,
+    surface_info: &mut StoredSurfaceInfo,
+) -> Option<bool> {
+    match *event {
+        Event::Resumed => {
+            if surface.is_none() {
+                *surface = Some(Arc::new(
+                    unsafe { instance.create_surface(window) }.unwrap(),
+                ));
+            }
+            Some(false)
+        }
+        Event::Suspended => {
+            *surface = None;
+            Some(true)
+        }
+        Event::WindowEvent {
+            event: winit::event::WindowEvent::Resized(size),
+            ..
+        } => {
+            log::debug!("resize {:?}", size);
+            let size = UVec2::new(size.width, size.height);
+
+            if size.x == 0 || size.y == 0 {
+                return Some(false);
+            }
+
+            surface_info.size = size;
+            surface_info.scale_factor = app.scale_factor();
+            surface_info.sample_count = app.sample_count();
+            surface_info.present_mode = app.present_mode();
+
+            // Winit erroniously stomps on the canvas CSS when a scale factor
+            // change happens, so we need to put it back to normal. We can't
+            // do this in a scale factor changed event, as the override happens
+            // after the event is sent.
+            //
+            // https://github.com/rust-windowing/winit/issues/3023
+            #[cfg(target_arch = "wasm32")]
+            {
+                use winit::platform::web::WindowExtWebSys;
+                let canvas = window.canvas().unwrap();
+                let style = canvas.style();
+
+                style.set_property("width", "100%").unwrap();
+                style.set_property("height", "100%").unwrap();
+            }
+
+            // Reconfigure the surface for the new size.
+            rend3::configure_surface(
+                surface.as_ref().unwrap(),
+                &renderer.device,
+                TextureFormat::Bgra8Unorm,
+                size,
+                surface_info.present_mode,
+            );
+            let alpha_mode = wgpu::CompositeAlphaMode::Auto;
+            let config = wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                width: size.x,
+                height: size.y,
+                present_mode: wgpu::PresentMode::Fifo,
+                alpha_mode,
+                view_formats: Vec::new(),
+            };
+            surface
+                .as_ref()
+                .unwrap()
+                .configure(&renderer.device, &config);
+            // Tell the renderer about the new aspect ratio.
+            renderer.set_aspect_ratio(size.x as f32 / size.y as f32);
+            Some(false)
+        }
+        _ => None,
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn winit_run<F, T>(
+    event_loop: winit::event_loop::EventLoop<T>,
+    event_handler: F,
+) -> Result<(), winit::error::EventLoopError>
+where
+    F: FnMut(winit::event::Event<T>, &EventLoopWindowTarget<T>) + 'static,
+    T: 'static,
+{
+    event_loop.run(event_handler)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn winit_run<F, T>(event_loop: EventLoop<T>, event_handler: F)
+where
+    F: FnMut(winit::event::Event<T>, &EventLoopWindowTarget<T>) + 'static,
+    T: 'static,
+{
+    use wasm_bindgen::prelude::*;
+
+    let winit_closure =
+        Closure::once_into_js(move || event_loop.run(event_handler).expect("Init failed"));
+
+    // make sure to handle JS exceptions thrown inside start.
+    // Otherwise wasm_bindgen_futures Queue would break and never handle any tasks
+    // again. This is required, because winit uses JS exception for control flow
+    // to escape from `run`.
+    if let Err(error) = call_catch(&winit_closure) {
+        let is_control_flow_exception = error.dyn_ref::<js_sys::Error>().map_or(false, |e| {
+            e.message().includes("Using exceptions for control flow", 0)
+        });
+
+        if !is_control_flow_exception {
+            web_sys::console::error_1(&error);
+        }
+    }
+
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(catch, js_namespace = Function, js_name = "prototype.call.call")]
+        fn call_catch(this: &JsValue) -> Result<(), JsValue>;
+    }
 }
