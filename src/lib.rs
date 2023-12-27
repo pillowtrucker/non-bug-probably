@@ -343,7 +343,7 @@ impl SceneViewer {
         let samples =
             option_arg(args.opt_value_from_fn("--msaa", extract_msaa)).unwrap_or(SampleCount::One);
         let present_mode = option_arg(args.opt_value_from_fn(["-v", "--vsync"], extract_vsync))
-            .unwrap_or(rend3::types::PresentMode::Fifo);
+            .unwrap_or(rend3::types::PresentMode::Immediate);
 
         // Windowing
         let absolute_mouse: bool = args.contains("--absolute-mouse");
@@ -836,27 +836,22 @@ impl rend3_framework::App for SceneViewer {
                             &temp_view,
                         )
                     };
+                    /*
+                                        let mut encoder =
+                                            renderer
+                                                .device
+                                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                                    label: Some("Part Render Encoder"),
+                                                });
 
-                    let mut encoder =
-                        renderer
-                            .device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("Part Render Encoder"),
-                            });
 
-                    if frame.texture.size() == inox_texture.size() {
-                        warn!(
-                            "frame {:?} inox {:?}",
-                            frame.texture.size(),
-                            inox_texture.size()
-                        );
-                        encoder.copy_texture_to_texture(
-                            inox_texture.as_image_copy(),
-                            frame.texture.as_image_copy(),
-                            frame.texture.size(),
-                        );
-                        renderer.queue.submit(std::iter::once(encoder.finish()));
-                    }
+                                            encoder.copy_texture_to_texture(
+                                                inox_texture.as_image_copy(),
+                                                frame.texture.as_image_copy(),
+                                                frame.texture.size(),
+                                            );
+                                            renderer.queue.submit(std::iter::once(encoder.finish()));
+                    */
                 }
                 frame.present();
                 // mark the end of the frame for tracy/other profilers
@@ -1027,7 +1022,7 @@ pub fn main() {
                             &iad.device,
                             format,
                             glam::UVec2::new(window_size.width, window_size.height),
-                            rend3::types::PresentMode::Fifo,
+                            rend3::types::PresentMode::Immediate,
                         );
                         let alpha_mode = wgpu::CompositeAlphaMode::Auto;
                         let config = wgpu::SurfaceConfiguration {
@@ -1036,7 +1031,7 @@ pub fn main() {
                             format: wgpu::TextureFormat::Bgra8Unorm,
                             width: window_size.width,
                             height: window_size.height,
-                            present_mode: wgpu::PresentMode::Fifo,
+                            present_mode: wgpu::PresentMode::Immediate,
                             alpha_mode,
                             view_formats: Vec::new(),
                         };
@@ -1242,7 +1237,7 @@ fn handle_surface(
                 format: wgpu::TextureFormat::Bgra8Unorm,
                 width: size.x,
                 height: size.y,
-                present_mode: wgpu::PresentMode::Fifo,
+                present_mode: wgpu::PresentMode::Immediate,
                 alpha_mode,
                 view_formats: Vec::new(),
             };
