@@ -5,7 +5,7 @@ use std::{
 
 use glam::{uvec2, vec2, DVec2, Mat3A, Mat4, UVec2, Vec2, Vec3, Vec3A};
 use inox2d::formats::inp::parse_inp;
-use log::{info, logger};
+use log::{info, logger, warn};
 use pico_args::Arguments;
 use rend3::{
     types::{
@@ -19,7 +19,7 @@ use rend3_framework::{lock, App as _, AssetPath, Event, Mutex, UserResizeEvent};
 use rend3_gltf::GltfSceneInstance;
 use rend3_routine::{base::BaseRenderGraph, pbr::NormalTextureYDirection, skybox::SkyboxRoutine};
 use web_time::Instant;
-use wgpu::{Features, Surface};
+use wgpu::{Extent3d, Features, Surface};
 use wgpu_profiler::GpuTimerScopeResult;
 #[cfg(target_arch = "wasm32")]
 use winit::keyboard::PhysicalKey::Code;
@@ -321,6 +321,7 @@ struct SceneViewer {
     grabber: Option<rend3_framework::Grabber>,
     inox_model: inox2d::model::Model,
     inox_renderer: Option<inox2d_wgpu::Renderer>,
+    inox_texture: Option<wgpu::Texture>,
 }
 impl SceneViewer {
     pub fn new() -> Self {
@@ -454,7 +455,7 @@ impl SceneViewer {
             samples,
             timestamp_start,
             fullscreen,
-
+            inox_texture: None,
             scancode_status: FastHashMap::default(),
             camera_pitch: camera_info[3],
             camera_yaw: camera_info[4],
@@ -583,6 +584,22 @@ impl rend3_framework::App for SceneViewer {
         );
         inox_renderer.camera.scale = Vec2::splat(0.12);
         self.inox_renderer = Some(inox_renderer);
+
+        let inox_texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("inox texture"),
+            size: Extent3d {
+                width: window.inner_size().width,
+                height: window.inner_size().height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[wgpu::TextureFormat::Bgra8Unorm],
+        });
+        self.inox_texture = Some(inox_texture);
         spawn(async move {
             let loader = rend3_framework::AssetLoader::new_local(
                 concat!(env!("CARGO_MANIFEST_DIR"), "/resources/"),
@@ -799,6 +816,7 @@ impl rend3_framework::App for SceneViewer {
                 );
                 // Dispatch a render using the built up rendergraph!
                 self.previous_profiling_stats = graph.execute(renderer, &mut eval_output);
+
                 {
                     let puppet = &mut self.inox_model.puppet;
                     puppet.begin_set_params();
@@ -806,42 +824,40 @@ impl rend3_framework::App for SceneViewer {
                     puppet.set_param("Head:: Yaw-Pitch", vec2(t.cos(), t.sin()));
                     puppet.end_set_params();
                 }
+                if let Some(ref mut inox_texture) = self.inox_texture {
+                    let temp_view =
+                        inox_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-                let temp_texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
-                    label: None,
-                    size: frame.texture.size(),
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: frame.texture.format(),
-                    usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[frame.texture.format()],
-                });
+                    if let Some(ref mut ir) = self.inox_renderer {
+                        ir.render(
+                            &renderer.queue,
+                            &renderer.device,
+                            &self.inox_model.puppet,
+                            &temp_view,
+                        )
+                    };
 
-                let temp_view = temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let mut encoder =
+                        renderer
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("Part Render Encoder"),
+                            });
 
-                if let Some(ref mut ir) = self.inox_renderer {
-                    ir.render(
-                        &renderer.queue,
-                        &renderer.device,
-                        &self.inox_model.puppet,
-                        &temp_view,
-                    )
-                };
-
-                let mut encoder =
-                    renderer
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("Part Render Encoder"),
-                        });
-                encoder.copy_texture_to_texture(
-                    temp_texture.as_image_copy(),
-                    frame.texture.as_image_copy(),
-                    frame.texture.size(),
-                );
-                renderer.queue.submit(std::iter::once(encoder.finish()));
-
+                    if frame.texture.size() == inox_texture.size() {
+                        warn!(
+                            "frame {:?} inox {:?}",
+                            frame.texture.size(),
+                            inox_texture.size()
+                        );
+                        encoder.copy_texture_to_texture(
+                            inox_texture.as_image_copy(),
+                            frame.texture.as_image_copy(),
+                            frame.texture.size(),
+                        );
+                        renderer.queue.submit(std::iter::once(encoder.finish()));
+                    }
+                }
                 frame.present();
                 // mark the end of the frame for tracy/other profilers
                 profiling::finish_frame!();
@@ -1084,7 +1100,7 @@ pub fn main() {
                         };
                         let mut control_flow = event_loop_window_target.control_flow();
                         if let Some(suspend) = handle_surface(
-                            &app,
+                            &mut app,
                             &window,
                             &event,
                             &iad.instance,
@@ -1140,7 +1156,7 @@ pub fn main() {
 }
 #[allow(clippy::too_many_arguments)]
 fn handle_surface(
-    app: &SceneViewer,
+    app: &mut SceneViewer,
     window: &Window,
     event: &Event<()>,
     instance: &wgpu::Instance,
@@ -1167,8 +1183,11 @@ fn handle_surface(
             ..
         } => {
             log::debug!("resize {:?}", size);
-            let size = UVec2::new(size.width, size.height);
 
+            let size = UVec2::new(size.width, size.height);
+            if let Some(ref mut inox_renderer) = app.inox_renderer {
+                inox_renderer.resize(size)
+            };
             if size.x == 0 || size.y == 0 {
                 return Some(false);
             }
@@ -1194,6 +1213,21 @@ fn handle_surface(
                 style.set_property("height", "100%").unwrap();
             }
 
+            let inox_texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("inox texture"),
+                size: Extent3d {
+                    width: size.x,
+                    height: size.y,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[wgpu::TextureFormat::Bgra8Unorm],
+            });
+            app.inox_texture = Some(inox_texture);
             // Reconfigure the surface for the new size.
             rend3::configure_surface(
                 surface.as_ref().unwrap(),
